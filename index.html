@@ -282,7 +282,7 @@
         </div>
       </div>
     </section>
-    <input type="file" id="file" accept="image/*" multiple hidden>
+    <input type="file" id="file" accept="image/*,.heic,.heif" multiple hidden>
 
     <section class="card batch hidden" id="batchWrap">
       <div class="bside">
@@ -438,16 +438,56 @@
     pump();
   }
 
-  function decode(file) {
+  function loadImage(blob) {
     return new Promise((res, rej) => {
-      const url = URL.createObjectURL(file), img = new Image();
+      const url = URL.createObjectURL(blob), img = new Image();
       img.onload = () => { URL.revokeObjectURL(url); res(img); };
-      img.onerror = () => {
-        URL.revokeObjectURL(url);
-        rej(new Error(/hei[cf]/i.test(file.name + file.type) ? 'HEIC not supported in this browser. Export as JPG first.' : 'Could not read image.'));
-      };
+      img.onerror = () => { URL.revokeObjectURL(url); rej(new Error('Could not read image.')); };
       img.src = url;
     });
+  }
+
+  // HEIC/HEIF (iPhone photos): Safari opens them natively. Other browsers get a
+  // decoder (heic-to, ~3 MB) that is only downloaded the first time it's needed.
+  // Each file is converted once to a high-quality JPEG and reused after that.
+  const HEIC_LIB = 'https://cdn.jsdelivr.net/npm/heic-to@1.6.7/dist/iife/heic-to.js';
+  let heicLib = null;
+  const heicCache = new WeakMap();
+  function loadHeicLib() {
+    return heicLib ||= new Promise((res, rej) => {
+      const s = document.createElement('script');
+      s.src = HEIC_LIB; s.async = true;
+      s.onload = () => window.HeicTo ? res(window.HeicTo) : rej(new Error('HEIC decoder failed to load.'));
+      s.onerror = () => { heicLib = null; rej(new Error('HEIC decoder failed to load. Check your connection.')); };
+      document.head.appendChild(s);
+    });
+  }
+  async function looksHeic(file) {
+    if (/hei[cf]/i.test(file.type) || /\.hei[cf]$/i.test(file.name || '')) return true;
+    const b = new Uint8Array(await file.slice(4, 12).arrayBuffer());   // ISO-BMFF: "ftyp" + brand
+    const tag = String.fromCharCode(...b);
+    return tag.startsWith('ftyp') && /^(heic|heix|hevc|hevx|heim|heis|mif1|msf1)$/.test(tag.slice(4));
+  }
+  function heicToJpeg(file) {
+    if (!heicCache.has(file)) {
+      const p = loadHeicLib().then(HeicTo => HeicTo({ blob: file, type: 'image/jpeg', quality: 0.95 }));
+      p.catch(() => heicCache.delete(file));
+      heicCache.set(file, p);
+    }
+    return heicCache.get(file);
+  }
+  async function decode(file) {
+    if (heicCache.has(file)) return loadImage(await heicCache.get(file));
+    try {
+      return await loadImage(file);
+    } catch (e) {
+      if (!(await looksHeic(file))) throw e;
+      const lbl = $('loading'), was = lbl.textContent;
+      lbl.textContent = 'Converting HEIC…';
+      try { return await loadImage(await heicToJpeg(file)); }
+      catch (err) { throw new Error(/load/.test(err.message) ? err.message : 'Could not read this HEIC file.'); }
+      finally { lbl.textContent = was; }
+    }
   }
   function prescale(img) {
     let c = img, w = img.naturalWidth, h = img.naturalHeight;

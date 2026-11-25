@@ -507,7 +507,46 @@
   // ---------- render core ----------
   const geom = it => { const s = W / it.crop.w; return { s, x0: -it.crop.x * s, y0: -it.crop.y * s }; };
 
+  // High-quality resize: Lanczos3 (like Photoshop's sharper bicubic) via @jsquash/resize.
+  // The browser's own resize is used instantly while you crop; the sharp version replaces it
+  // as soon as it's ready, and every export waits for it.
+  const RESIZE_LIB = 'https://cdn.jsdelivr.net/npm/@jsquash/resize@2.1.1/+esm';
+  let resizeLib = null;
+  const loadResize = () => resizeLib ||= import(RESIZE_LIB).then(m => m.default).catch(() => { resizeLib = null; return null; });
+  const hqKey = (it, source) => `${source.width}|${it.crop.x}|${it.crop.y}|${it.crop.w}`;
+  const hqJobs = new Map();
+  function ensureHQ(it, source) {
+    const key = hqKey(it, source);
+    if (it.hq?.key === key) return Promise.resolve(true);
+    const job = key + '#' + it.id;
+    if (hqJobs.has(job)) return hqJobs.get(job);
+    const p = (async () => {
+      const resize = await loadResize();
+      if (!resize) return false;
+      const k = source.width / it.natW;
+      const sx = it.crop.x * k, sy = it.crop.y * k, sw = it.crop.w * k, sh = Math.min(sw * R, source.height - sy);
+      // Very large crops: a first browser step down to 3x the output size keeps Lanczos fast.
+      const f = Math.min(1, (3 * W) / sw);
+      const iw = Math.max(1, Math.round(sw * f)), ih = Math.max(1, Math.round(sh * f));
+      const c = document.createElement('canvas'); c.width = iw; c.height = ih;
+      const x = c.getContext('2d', { willReadFrequently:true });
+      x.imageSmoothingEnabled = true; x.imageSmoothingQuality = 'high';
+      x.drawImage(source, sx, sy, sw, sh, 0, 0, iw, ih);
+      const out = await resize(x.getImageData(0, 0, iw, ih), { width: W, height: H, method: 'lanczos3', premultiply: false, linearRGB: false });
+      const oc = mk(); oc.getContext('2d').putImageData(out, 0, 0);
+      it.hq = { key, canvas: oc };
+      return true;
+    })().catch(() => false).finally(() => hqJobs.delete(job));
+    hqJobs.set(job, p);
+    return p;
+  }
+
   function drawCrop(ctx, it, source) {
+    if (it.hq?.key === hqKey(it, source)) {
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.drawImage(it.hq.canvas, 0, 0);
+      return;
+    }
     const k = source.width / it.natW;
     let img = source, sx = it.crop.x * k, sy = it.crop.y * k, sw = it.crop.w * k, sh = Math.min(sw * R, source.height - sy);
     while (sw / W > 2) {   // step down for clean downscales
@@ -563,6 +602,7 @@
   async function openItem(it) {
     if (cur === it) return;
     if (cur && baseData) cur.thumb = thumbOf(outC);
+    if (cur) cur.hq = null;
     const tok = ++loadToken;
     cur = it; src = null; baseData = null;
     stage.classList.remove('empty'); $('loading').classList.remove('hidden');
@@ -580,6 +620,9 @@
     }
     $('loading').classList.add('hidden');
     updateMeta(); renderBase();
+    await ensureHQ(it, src);
+    if (tok !== loadToken) return;
+    renderBase();
     if (it.quality == null) { it.quality = await fitQuality(outC, KB200); }
     syncQuality(); requestSize();
   }
@@ -610,6 +653,10 @@
 
   function renderBase() {
     if (!src || !cur) return;
+    if (cur.hq?.key !== hqKey(cur, src)) {
+      const it = cur, s = src;
+      ensureHQ(it, s).then(ok => { if (ok && it === cur && s === src && mode === 'edit') renderBase(); });
+    }
     drawCrop(bctx, cur, src);
     baseData = bctx.getImageData(0, 0, W, H);
     drawMask(mctx, cur);
@@ -916,7 +963,20 @@
   });
 
   // ---------- quality / size (live) ----------
-  const toBlob = (c, q) => new Promise(r => c.toBlob(r, 'image/jpeg', q / 100));
+  // JPEG encoding with mozjpeg (via @jsquash/jpeg): noticeably more detail per KB than the
+  // browser's built-in encoder. Falls back to the browser encoder if it can't load.
+  const JPEG_LIB = 'https://cdn.jsdelivr.net/npm/@jsquash/jpeg@1.6.0/+esm';
+  let jpegLib = null;
+  const loadJpeg = () => jpegLib ||= import(JPEG_LIB).then(m => m.encode).catch(() => { jpegLib = null; return null; });
+  loadJpeg(); loadResize();   // warm up in the background
+  const pixelsOf = c => c.getContext('2d').getImageData(0, 0, c.width, c.height);
+  async function toBlob(c, q, pixels) {
+    const encode = await loadJpeg();
+    if (encode) {
+      try { return new Blob([await encode(pixels || pixelsOf(c), { quality: q })], { type: 'image/jpeg' }); } catch {}
+    }
+    return new Promise(r => c.toBlob(r, 'image/jpeg', q / 100));
+  }
   const kb = bytes => Math.ceil(bytes / 1000);
   const sizeClass = bytes => bytes == null ? '' : kb(bytes) <= 200 ? 'g' : kb(bytes) <= 300 ? 'y' : 'r';
   const COLORS = { g:'#13914a', y:'#e2a400', r:'#c60800', '':'#999' };
@@ -924,8 +984,9 @@
 
   async function fitQuality(canvas, limit) {
     let lo = Q_MIN, hi = Q_CAP, best = null;
+    const px = pixelsOf(canvas);
     while (lo <= hi) {
-      const mid = (lo + hi) >> 1, b = await toBlob(canvas, mid);
+      const mid = (lo + hi) >> 1, b = await toBlob(canvas, mid, px);
       if (b.size <= limit) { best = mid; lo = mid + 1; } else hi = mid - 1;
     }
     return best ?? Q_MIN;
@@ -989,7 +1050,10 @@
         const img = await decode(it.file);
         it.natW = img.naturalWidth; it.natH = img.naturalHeight;
         if (!it.crop) it.crop = defaultCrop(it);
-        const c = renderFull(it, prescale(img));
+        const s = prescale(img);
+        await ensureHQ(it, s);
+        const c = renderFull(it, s);
+        if (it !== cur) it.hq = null;
         if (it === cur) continue;
         if (!it.qManual || it.quality == null) it.quality = await fitQuality(c, KB200);
         it.size = (await toBlob(c, it.quality)).size;
@@ -1056,7 +1120,10 @@
         else {
           const img = await decode(it.file); it.natW = img.naturalWidth; it.natH = img.naturalHeight;
           if (!it.crop) it.crop = defaultCrop(it);
-          c = renderFull(it, prescale(img));
+          const s = prescale(img);
+          await ensureHQ(it, s);
+          c = renderFull(it, s);
+          it.hq = null;
         }
         if (it.quality == null) it.quality = await fitQuality(c, KB200);
         const b = await toBlob(c, it.quality);
